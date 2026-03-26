@@ -427,6 +427,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        clip_point=1,
     ):
         """
         Generate samples from the model.
@@ -457,6 +458,7 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            clip_point=clip_point,
         ):
             final = sample
         return final["sample"]
@@ -472,6 +474,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        clip_point=1.0,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -495,6 +498,7 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
+        count = 0
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
@@ -509,6 +513,10 @@ class GaussianDiffusion:
                 )
                 yield out
                 img = out["sample"]
+                count+=1
+                if count >= clip_point*len(indices):
+                    return
+
 
     def ddim_sample(
         self,

@@ -1,0 +1,4 @@
+imagenet100/
+_pycache__/
+results/
+pretrained_models/

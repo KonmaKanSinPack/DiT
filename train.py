@@ -201,8 +201,28 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
+
+            #----执行svd分解
+            # recon = diffusion.q_sample(x, 0.5*diffusion.num_timesteps)  # Add noise to the latents according to the diffusion process
+            U, S, Vt = torch.linalg.svd(x)
+
+            energy = S ** 2
+            cumulative_energy = torch.cumsum(energy, dim=-1)
+            total_energy = energy.sum(dim=-1, keepdim=True)
+            
+            energy_threshold = 0.9
+            mask = (cumulative_energy / total_energy) <= energy_threshold
+            r_use = mask.sum(dim=-1).max().item() # 取全局最大的 r 以保持张量对齐
+            r_use = max(int(r_use), 1) # 至少保留一个奇异值
+
+            Sr =S[:, :, :r_use]
+            recon = (U[:, :, :, :r_use] * Sr.unsqueeze(-2)) @ Vt[:, :, :r_use, :]#.reshape(b, c, h, w)
+            # print(f"recon shape:{recon.shape}")
+            #----结束svd分解
+
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             opt.zero_grad()

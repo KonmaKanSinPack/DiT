@@ -61,8 +61,26 @@ def main(args):
     samples = diffusion.p_sample_loop(
         model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )
+    
+    b,c,h,w = samples.shape
+    print(f"shape:{samples.shape}")
+    U, S, Vt = torch.linalg.svd(samples)
+    
+    energy = S ** 2
+    cumulative_energy = torch.cumsum(energy, dim=-1)
+    total_energy = energy.sum(dim=-1, keepdim=True)
+    
+    energy_threshold = 0.9
+    mask = (cumulative_energy / total_energy) <= energy_threshold
+    r_use = mask.sum(dim=-1).max().item() # 取全局最大的 r 以保持张量对齐
+    r_use = max(int(r_use), 1) # 至少保留一个奇异值
+
+    Sr =S[:, :, :r_use]
+    recon = (U[:, :, :, :r_use] * Sr.unsqueeze(-2)) @ Vt[:, :, :r_use, :]#.reshape(b, c, h, w)
+    print(f"recon shape:{recon.shape}")
+
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
+    samples = vae.decode(recon / 0.18215).sample
 
     # Save and display images:
     save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
