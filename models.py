@@ -230,14 +230,25 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, x_cond=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+
+        
+
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+
+        if x_cond is None:
+            print("============x_cond is None===============")
+        else: 
+            x_cond = self.x_embedder(x_cond) + self.pos_embed
+
+        x = torch.cat([x, x_cond], dim=-1) if x_cond is not None else x
+        # x = x + x_cond
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)

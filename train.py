@@ -206,17 +206,19 @@ def main(args):
             model_kwargs = dict(y=y)
 
             #----执行svd分解
-            # recon = diffusion.q_sample(x, 0.5*diffusion.num_timesteps)  # Add noise to the latents according to the diffusion process
-            U, S, Vt = torch.linalg.svd(x)
+            half_time = int(0.5*diffusion.num_timesteps)*torch.ones((x.shape[0], ),dtype=torch.int, device=device)
+            recon = diffusion.q_sample(x, half_time)  # Add noise to the latents according to the diffusion process
+            U, S, Vt = torch.linalg.svd(recon)
 
-            energy = S ** 2
-            cumulative_energy = torch.cumsum(energy, dim=-1)
-            total_energy = energy.sum(dim=-1, keepdim=True)
+            # energy = S ** 2
+            # cumulative_energy = torch.cumsum(energy, dim=-1)
+            # total_energy = energy.sum(dim=-1, keepdim=True)
             
-            energy_threshold = 0.9
-            mask = (cumulative_energy / total_energy) <= energy_threshold
-            r_use = mask.sum(dim=-1).max().item() # 取全局最大的 r 以保持张量对齐
-            r_use = max(int(r_use), 1) # 至少保留一个奇异值
+            # energy_threshold = 0.9
+            # mask = (cumulative_energy / total_energy) <= energy_threshold
+            # r_use = mask.sum(dim=-1).max().item() # 取全局最大的 r 以保持张量对齐
+            # r_use = max(int(r_use), 1) # 至少保留一个奇异值
+            r_use = int(0.25*S.size(-1))
 
             Sr =S[:, :, :r_use]
             recon = (U[:, :, :, :r_use] * Sr.unsqueeze(-2)) @ Vt[:, :, :r_use, :]#.reshape(b, c, h, w)
