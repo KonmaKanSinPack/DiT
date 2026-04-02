@@ -236,9 +236,8 @@ class DiT(nn.Module):
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        x_cond: optional (N, C, H, W)
         """
-
-        
 
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
@@ -247,13 +246,15 @@ class DiT(nn.Module):
         else: 
             x_cond = self.x_embedder(x_cond) + self.pos_embed
 
-        x = torch.cat([x, x_cond], dim=-1) if x_cond is not None else x
+        x = torch.cat([x, x_cond], dim=-2) if x_cond is not None else x
         # x = x + x_cond
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
+        
+        x = x[:, :int(x.shape[1] // 2), :] if x_cond is not None else x
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x

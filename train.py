@@ -203,8 +203,7 @@ def main(args):
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            model_kwargs = dict(y=y)
-
+           
             #----执行svd分解
             half_time = int(0.5*diffusion.num_timesteps)*torch.ones((x.shape[0], ),dtype=torch.int, device=device)
             recon = diffusion.q_sample(x, half_time)  # Add noise to the latents according to the diffusion process
@@ -225,6 +224,7 @@ def main(args):
             # print(f"recon shape:{recon.shape}")
             #----结束svd分解
 
+            model_kwargs = dict(y=y,x_cond=recon)  
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
