@@ -7,6 +7,11 @@ from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 
 
+def create_resshift_diffusion(n_timestep=15, kappa=1.0):
+    """Create a ResShiftDiffusion instance."""
+    return gd.ResShiftDiffusion(n_timestep=n_timestep, kappa=kappa)
+
+
 def create_diffusion(
     timestep_respacing,
     noise_schedule="linear", 

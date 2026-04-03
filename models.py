@@ -241,9 +241,7 @@ class DiT(nn.Module):
 
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
-        if x_cond is None:
-            print("============x_cond is None===============")
-        else: 
+        if x_cond is not None:
             x_cond = self.x_embedder(x_cond) + self.pos_embed
 
         x = torch.cat([x, x_cond], dim=-2) if x_cond is not None else x

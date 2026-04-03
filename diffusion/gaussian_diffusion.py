@@ -879,3 +879,238 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res + th.zeros(broadcast_shape, device=timesteps.device)
+
+
+# ============================================================================
+#  ResShift Diffusion (Residual Shifting Diffusion)
+# ============================================================================
+
+def make_resshift_sqrt_etas_schedule(n_timestep=15, eta_T=0.99, p=0.3, min_noise_level=0.01):
+    """
+    Create the ResShift sqrt_etas schedule.
+    Uses an exponentially increasing schedule from etas_start to eta_T,
+    shaped by a power function for controlling the noise ramp-up.
+    """
+    k = 1.0
+    etas_start = min(min_noise_level / k, min_noise_level, math.sqrt(0.001))
+    increaser = math.exp(1.0 / (n_timestep - 1) * math.log(eta_T / etas_start))
+    base = np.ones([n_timestep, ]) * increaser
+    power_timestep = np.linspace(0, 1, n_timestep, endpoint=True) ** p
+    power_timestep *= (n_timestep - 1)
+    sqrt_etas = np.power(base, power_timestep) * etas_start
+    return sqrt_etas
+
+
+class ResShiftDiffusion:
+    """
+    ResShift Diffusion: a residual-shifting diffusion process for image restoration.
+
+    Instead of modeling x_0 directly, it models the *residual* e_0 = x_clean - x_degraded.
+    The forward process gradually corrupts this residual:
+        q(e_t | e_0) = (1 - η_t) * e_0 + κ * √η_t * ε
+
+    The model learns to predict e_0 from (e_t + y), where y is the degraded input.
+    During inference, starting from pure noise e_T, we iteratively denoise to recover e_0,
+    then reconstruct x = y + e_0.
+
+    Reference: ResShift (NIPS 2023)
+    """
+
+    def __init__(self, *, n_timestep=15, kappa=1.0):
+        self.kappa = kappa
+        self.num_timesteps = int(n_timestep)
+
+        # Build schedule
+        sqrt_etas = make_resshift_sqrt_etas_schedule(n_timestep=n_timestep)
+        etas = sqrt_etas ** 2
+        etas_prev = np.append(0.0, etas[:-1])
+        alphas = etas - etas_prev
+
+        self.sqrt_etas = sqrt_etas.astype(np.float64)
+        self.etas = etas.astype(np.float64)
+        self.alphas = alphas.astype(np.float64)
+        self.etas_prev = etas_prev.astype(np.float64)
+
+        # Posterior coefficients: q(e_{t-1} | e_t, e_0)
+        #   mean  = (η_{t-1}/η_t) * e_t  +  (α_t/η_t) * e_0
+        #   var   = κ² · (η_{t-1}/η_t) · α_t
+        self.posterior_mean_coef1 = etas_prev / etas          # η_{t-1} / η_t
+        self.posterior_mean_coef2 = alphas / etas              # α_t / η_t
+        self.posterior_variance = kappa ** 2 * etas_prev / etas * alphas
+
+        posterior_variance_clipped = np.append(
+            self.posterior_variance[1], self.posterior_variance[1:]
+        )
+        self.posterior_variance_clipped = posterior_variance_clipped
+        self.posterior_log_variance_clipped = np.log(np.maximum(posterior_variance_clipped, 1e-20))
+
+    # ---- Forward process ----
+
+    def q_sample(self, e_0, t, noise=None):
+        """
+        Forward process: sample e_t from q(e_t | e_0).
+            e_t = (1 - η_t) * e_0 + κ * √η_t * noise
+        """
+        if noise is None:
+            noise = th.randn_like(e_0)
+        return (
+            e_0
+            - _extract_into_tensor(self.etas, t, e_0.shape) * e_0
+            + _extract_into_tensor(self.kappa * self.sqrt_etas, t, e_0.shape) * noise
+        )
+
+    def q_posterior_mean_variance(self, e_0, e_t, t):
+        """
+        Posterior distribution: q(e_{t-1} | e_t, e_0).
+            mean = (η_{t-1}/η_t) * e_t + (α_t/η_t) * e_0
+            var  = κ² · (η_{t-1}/η_t) · α_t
+        """
+        posterior_mean = (
+            _extract_into_tensor(self.posterior_mean_coef1, t, e_t.shape) * e_t
+            + _extract_into_tensor(self.posterior_mean_coef2, t, e_t.shape) * e_0
+        )
+        posterior_variance = _extract_into_tensor(self.posterior_variance, t, e_t.shape)
+        posterior_log_variance_clipped = _extract_into_tensor(
+            self.posterior_log_variance_clipped, t, e_t.shape
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def prior_sample(self, shape_like, noise=None, device=None):
+        """
+        Sample e_T from the prior: e_T = κ * √η_T * noise.
+        This is the starting point for the reverse (sampling) process.
+        """
+        if device is None:
+            device = shape_like.device
+        if noise is None:
+            noise = th.randn_like(shape_like)
+        t = th.tensor([self.num_timesteps - 1] * shape_like.shape[0], device=device).long()
+        return _extract_into_tensor(self.kappa * self.sqrt_etas, t, shape_like.shape) * noise
+
+    # ---- Reverse process ----
+
+    def p_mean_variance(self, model, e_t, y, t, clip_denoised=True, model_kwargs=None):
+        """
+        Apply model to get p(e_{t-1} | e_t).
+        Model input:  e_t + y  (noisy residual added back to degraded input)
+        Model output: predicted e_0 (clean residual)
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        B, C = e_t.shape[:2]
+        model_input = e_t + y
+        model_output = model(model_input, t, **model_kwargs)
+
+        if isinstance(model_output, tuple):
+            model_output = model_output[0]
+
+        # If model outputs 2*C channels (learned variance), take only the first C
+        if model_output.shape[1] != C:
+            model_output, _ = th.split(model_output, C, dim=1)
+
+        # model_output is the predicted residual e_0
+        pred_e0 = model_output
+
+        if clip_denoised:
+            # Clip the reconstructed image y + e_0 to [-1, 1], then recompute e_0
+            pred_recon = pred_e0 + y
+            pred_recon = pred_recon.clamp(-1, 1)
+            pred_e0 = pred_recon - y
+
+        model_mean, posterior_variance, posterior_log_variance_clipped = \
+            self.q_posterior_mean_variance(e_0=pred_e0, e_t=e_t, t=t)
+
+        return {
+            "mean": model_mean,
+            "variance": posterior_variance,
+            "log_variance": posterior_log_variance_clipped,
+            "pred_e0": pred_e0,
+        }
+
+    def p_sample(self, model, e_t, y, t, clip_denoised=True, model_kwargs=None):
+        """
+        Sample e_{t-1} from the model.
+        """
+        out = self.p_mean_variance(
+            model, e_t, y, t,
+            clip_denoised=clip_denoised, model_kwargs=model_kwargs,
+        )
+        noise = th.randn_like(e_t)
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(e_t.shape) - 1)))
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        return {"sample": sample, "pred_e0": out["pred_e0"]}
+
+    def p_sample_loop(self, model, y, clip_denoised=True, model_kwargs=None,
+                      device=None, progress=False):
+        """
+        Full reverse sampling loop.
+        1. Start from e_T (scaled noise from the prior)
+        2. Iteratively denoise: e_T -> e_{T-1} -> ... -> e_0
+        3. Return reconstructed image: x = y + e_0
+        """
+        if device is None:
+            device = y.device
+
+        # Start from prior noise
+        e_t = self.prior_sample(y, device=device)
+
+        indices = list(range(self.num_timesteps))[::-1]
+        if progress:
+            from tqdm.auto import tqdm
+            indices = tqdm(indices, desc="ResShift sampling")
+
+        for i in indices:
+            t = th.tensor([i] * y.shape[0], device=device)
+            with th.no_grad():
+                out = self.p_sample(
+                    model, e_t, y, t,
+                    clip_denoised=clip_denoised, model_kwargs=model_kwargs,
+                )
+                e_t = out["sample"]
+
+        # Reconstruct: x = y + e_0
+        return y + e_t
+
+    # ---- Training ----
+
+    def training_losses(self, model, x_start, y, t, model_kwargs=None, noise=None):
+        """
+        Compute training losses for a single timestep.
+
+        :param model: the denoising model  (input: e_t + y, output: predicted e_0)
+        :param x_start: clean target images [B, C, H, W]
+        :param y: degraded input images [B, C, H, W]
+        :param t: timestep indices [B]
+        :param model_kwargs: extra kwargs for model (e.g. class labels, x_cond)
+        :param noise: optional pre-generated noise
+        :return: dict with key "loss" containing per-sample losses [B]
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+
+        # Compute residual
+        e_0 = x_start - y
+
+        # Forward process: get noisy residual
+        e_t = self.q_sample(e_0, t, noise=noise)
+
+        # Model predicts residual from (e_t + y)
+        model_input = e_t + y
+        model_output = model(model_input, t, **model_kwargs)
+
+        if isinstance(model_output, tuple):
+            model_output = model_output[0]
+
+        B, C = e_t.shape[:2]
+        if model_output.shape[1] != C:
+            model_output, _ = th.split(model_output, C, dim=1)
+
+        # MSE loss: predict the clean residual e_0
+        target = e_0
+        assert model_output.shape == target.shape
+        mse = mean_flat((target - model_output) ** 2)
+
+        return {"loss": mse, "mse": mse}
