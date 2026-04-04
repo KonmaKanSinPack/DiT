@@ -259,18 +259,32 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, x_cond=None):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        带有无分类器引导 (CFG) 的前向传播，兼容动态尺寸的 x_cond
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        half = x[: len(x) // 2]  # 获取真实的 Batch Size (比如 B)
+        combined = torch.cat([half, half], dim=0) # 尺寸变为 2B
+        
+        if x_cond is not None:
+            # 情况 1：你传进来的 x_cond 没有翻倍，尺寸正好是 B
+            if x_cond.shape[0] == half.shape[0]: 
+                # 答案在这里：直接把它自己复制一遍拼起来
+                x_cond_combined = torch.cat([x_cond, x_cond], dim=0) 
+                
+            # 情况 2：你在 sample.py 里已经把它翻倍过了，尺寸是 2B
+            elif x_cond.shape[0] == x.shape[0]: 
+                x_cond_half = x_cond[: len(x_cond) // 2]
+                # 答案在这里：取出一半，然后自己复制自己拼起来
+                x_cond_combined = torch.cat([x_cond_half, x_cond_half], dim=0)
+            else:
+                raise ValueError("x_cond 的 Batch Size 维度不对劲！")
+        else:
+            x_cond_combined = None
+            
+        # 现在 combined 和 x_cond_combined 的尺寸完美一致，都是 2B
+        model_out = self.forward(combined, t, y, x_cond=x_cond_combined)
+        
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)

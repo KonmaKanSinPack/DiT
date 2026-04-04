@@ -30,6 +30,7 @@ import os
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+from download import find_model
 
 
 #################################################################################
@@ -104,6 +105,139 @@ def center_crop_arr(pil_image, image_size):
 
 
 #################################################################################
+#                              FID Evaluation                                   #
+#################################################################################
+
+@torch.no_grad()
+def evaluate_fid(ema_model, vae, diffusion, fid_data_path, device, logger,
+                 num_classes=1000, image_size=256, num_fid_samples=1024,
+                 fid_batch_size=8, num_sampling_steps=250, cfg_scale=4.0,
+                 use_xcond=True):
+    """
+    Compute FID score between generated and real images.
+    Uses InceptionV3 features (2048-dim) from torchvision.
+    Samples with classifier-free guidance (CFG) for quality.
+    """
+    from scipy import linalg
+    from torchvision.models import inception_v3
+    import torch.nn.functional as F
+
+    logger.info(f"Computing FID with {num_fid_samples} samples, "
+                f"{num_sampling_steps} steps, cfg={cfg_scale}, xcond={use_xcond}...")
+
+    latent_size = image_size // 8
+
+    # Load InceptionV3 for feature extraction
+    inception = inception_v3(pretrained=True, transform_input=False).to(device)
+    inception.fc = torch.nn.Identity()
+    inception.eval()
+
+    # ImageNet normalization for Inception
+    inc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    inc_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    # FID dataset (no random flip for evaluation)
+    fid_transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    ])
+    fid_dataset = ImageFolder(fid_data_path, transform=fid_transform)
+    fid_loader = DataLoader(fid_dataset, batch_size=fid_batch_size, shuffle=True,
+                            num_workers=4, pin_memory=True, drop_last=True)
+
+    # Create diffusion with fewer steps for faster sampling
+    sample_diffusion = create_diffusion(str(num_sampling_steps))
+
+    real_feats = []
+    fake_feats = []
+    n_collected = 0
+
+    for x_batch, y_batch in fid_loader:
+        if n_collected >= num_fid_samples:
+            break
+
+        bs = x_batch.shape[0]
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
+
+        # --- Real image inception features ---
+        real_01 = (x_batch + 1) / 2  # [-1,1] -> [0,1]
+        real_299 = F.interpolate(real_01, size=(299, 299), mode='bilinear', align_corners=False)
+        real_299 = (real_299 - inc_mean) / inc_std
+        real_feats.append(inception(real_299).cpu().numpy())
+
+        # --- Generate fake images with CFG ---
+        # Encode to latent space
+        latents = vae.encode(x_batch).latent_dist.sample().mul_(0.18215)
+
+        # Prepare x_cond if needed (same as training: noise at half_time + SVD)
+        x_cond_cfg = None
+        if use_xcond:
+            half_time = int(0.5 * diffusion.num_timesteps) * torch.ones(
+                (bs,), dtype=torch.int, device=device
+            )
+            noisy = diffusion.q_sample(latents, half_time)
+            U, S, Vt = torch.linalg.svd(noisy)
+            r_use = int(0.25 * S.size(-1))
+            Sr = S[:, :, :r_use]
+            x_cond = (U[:, :, :, :r_use] * Sr.unsqueeze(-2)) @ Vt[:, :, :r_use, :]
+            # Double x_cond for CFG (conditional + unconditional use same x_cond)
+            x_cond_cfg = torch.cat([x_cond, x_cond], 0)
+
+        # Prepare CFG inputs: double z and y
+        z = torch.randn(bs, 4, latent_size, latent_size, device=device)
+        z = torch.cat([z, z], 0)
+        y_null = torch.tensor([num_classes] * bs, device=device)
+        y_cfg = torch.cat([y_batch, y_null], 0)
+
+        model_kwargs = dict(y=y_cfg, cfg_scale=cfg_scale)
+        if use_xcond:
+            model_kwargs["x_cond"] = x_cond_cfg
+
+        samples = sample_diffusion.p_sample_loop(
+            ema_model.forward_with_cfg, z.shape, z, clip_denoised=False,
+            model_kwargs=model_kwargs, progress=False, device=device
+        )
+        # Remove the unconditional half
+        samples, _ = samples.chunk(2, dim=0)
+
+        # Decode to pixel space
+        fake_pixels = vae.decode(samples / 0.18215).sample
+        fake_01 = ((fake_pixels + 1) / 2).clamp(0, 1)
+        fake_299 = F.interpolate(fake_01, size=(299, 299), mode='bilinear', align_corners=False)
+        fake_299 = (fake_299 - inc_mean) / inc_std
+        fake_feats.append(inception(fake_299).cpu().numpy())
+
+        n_collected += bs
+        if n_collected % (fid_batch_size * 8) == 0:
+            logger.info(f"  FID progress: {n_collected}/{num_fid_samples}")
+
+    # Concatenate and trim to exact count
+    real_feats = np.concatenate(real_feats, axis=0)[:num_fid_samples]
+    fake_feats = np.concatenate(fake_feats, axis=0)[:num_fid_samples]
+
+    # Compute statistics
+    mu_r = np.mean(real_feats, axis=0)
+    sigma_r = np.cov(real_feats, rowvar=False)
+    mu_f = np.mean(fake_feats, axis=0)
+    sigma_f = np.cov(fake_feats, rowvar=False)
+
+    # Compute FID
+    diff = mu_r - mu_f
+    covmean, _ = linalg.sqrtm(sigma_r @ sigma_f, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = float(diff @ diff + np.trace(sigma_r + sigma_f - 2 * covmean))
+
+    del inception
+    torch.cuda.empty_cache()
+
+    logger.info(f"FID Score: {fid:.4f} ({n_collected} samples)")
+    return fid
+
+
+#################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
@@ -143,6 +277,11 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes
     )
+    # Load pretrained checkpoint if provided
+    if args.ckpt:
+        state_dict = find_model(args.ckpt)
+        model.load_state_dict(state_dict, strict=False)
+        logger.info(f"Loaded checkpoint from {args.ckpt}")
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -265,6 +404,27 @@ def main(args):
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
+        # FID evaluation at end of epoch
+        if args.fid_every > 0 and (epoch + 1) % args.fid_every == 0:
+            if rank == 0:
+                logger.info(f"Epoch {epoch}: running FID evaluation...")
+                fid_score = evaluate_fid(
+                    ema_model=ema,
+                    vae=vae,
+                    diffusion=diffusion,
+                    fid_data_path=args.fid_data_path,
+                    device=device,
+                    logger=logger,
+                    num_classes=args.num_classes,
+                    image_size=args.image_size,
+                    num_fid_samples=args.fid_samples,
+                    fid_batch_size=args.fid_batch_size,
+                    num_sampling_steps=args.fid_sampling_steps,
+                    cfg_scale=args.fid_cfg_scale,
+                    use_xcond=args.fid_use_xcond,
+                )
+            dist.barrier()
+
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -287,5 +447,13 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--fid-every", type=int, default=0, help="Evaluate FID every N epochs (0=disabled)")
+    parser.add_argument("--fid-data-path", type=str, default="./imagenet100/train", help="Path to FID evaluation data")
+    parser.add_argument("--fid-samples", type=int, default=1024, help="Number of samples for FID")
+    parser.add_argument("--fid-batch-size", type=int, default=8, help="Batch size for FID evaluation")
+    parser.add_argument("--fid-sampling-steps", type=int, default=250, help="Diffusion sampling steps for FID")
+    parser.add_argument("--fid-cfg-scale", type=float, default=4.0, help="CFG scale for FID sampling")
+    parser.add_argument("--fid-use-xcond", action="store_true", help="Use x_cond (SVD) during FID evaluation")
+    parser.add_argument("--ckpt", type=str, default=None, help="Path to pretrained DiT checkpoint")
     args = parser.parse_args()
     main(args)
